@@ -26,67 +26,98 @@ type SnapshotOptions struct {
 	OutBundle    string
 	Recipient    string
 	IdentityOut  string
+	ComposePaths []string
 }
 
 type SnapshotSummary struct {
-	ComposeFiles   int
-	CapturedFiles  int
-	ExternalFiles  int
-	SkippedMissing int
-	Manifest       manifest.Manifest
+	ComposeFiles          int
+	CapturedFiles         int
+	ExternalFiles         int
+	SkippedMissing        int
+	Manifest              manifest.Manifest
 	GeneratedIdentityPath string
 }
 
-func CreateSnapshot(opts SnapshotOptions) (SnapshotSummary, error) {
+type SnapshotPlan struct {
+	RootDir               string
+	OutBundle             string
+	ComposePaths          []string
+	Entries               []manifest.Entry
+	ExternalEntries       []manifest.Entry
+	SkippedMissing        int
+	WouldGenerateIdentity bool
+	IdentityPath          string
+	Manifest              manifest.Manifest
+}
+
+type snapshotBuildResult struct {
+	summary               SnapshotSummary
+	composeFiles          []string
+	entries               []manifest.Entry
+	recipient             string
+	validationKeyPath     string
+	wouldGenerateIdentity bool
+}
+
+func buildSnapshotPlan(opts SnapshotOptions, dryRun bool) (snapshotBuildResult, error) {
+	var result snapshotBuildResult
+
 	if runtime.GOOS != "linux" {
-		return SnapshotSummary{}, fmt.Errorf("linux-only MVP: current platform is %s", runtime.GOOS)
+		return result, fmt.Errorf("linux-only MVP: current platform is %s", runtime.GOOS)
 	}
 	if err := crypto.EnsureAgeInstalled(); err != nil {
-		return SnapshotSummary{}, err
+		return result, err
 	}
 
 	rootAbs, err := filepath.Abs(opts.RootDir)
 	if err != nil {
-		return SnapshotSummary{}, fmt.Errorf("resolve root path: %w", err)
+		return result, fmt.Errorf("resolve root path: %w", err)
 	}
 	st, err := os.Stat(rootAbs)
 	if err != nil {
-		return SnapshotSummary{}, fmt.Errorf("stat root path: %w", err)
+		return result, fmt.Errorf("stat root path: %w", err)
 	}
 	if !st.IsDir() {
-		return SnapshotSummary{}, fmt.Errorf("root path must be a directory")
+		return result, fmt.Errorf("root path must be a directory")
 	}
 
-	composeFiles, err := discovery.DiscoverComposeFiles(rootAbs)
+	composeFiles, err := resolveComposeFiles(rootAbs, opts.ComposePaths)
 	if err != nil {
-		return SnapshotSummary{}, err
+		return result, err
 	}
 	if len(composeFiles) == 0 {
-		return SnapshotSummary{}, fmt.Errorf("no compose files found under %s", rootAbs)
+		return result, fmt.Errorf("no compose files found under %s", rootAbs)
 	}
+	result.composeFiles = append([]string(nil), composeFiles...)
 
 	recipient := strings.TrimSpace(opts.Recipient)
-	validationKeyPath := ""
 	summary := SnapshotSummary{ComposeFiles: len(composeFiles)}
+	validationKeyPath := ""
 	if recipient == "" {
 		if opts.IdentityOut == "" {
 			opts.IdentityOut = "identity.key"
 		}
 		identityAbs, err := filepath.Abs(opts.IdentityOut)
 		if err != nil {
-			return SnapshotSummary{}, fmt.Errorf("resolve identity-out path: %w", err)
+			return result, fmt.Errorf("resolve identity-out path: %w", err)
 		}
 		if _, err := os.Stat(identityAbs); err == nil {
-			return SnapshotSummary{}, fmt.Errorf("identity key already exists: %s", identityAbs)
+			return result, fmt.Errorf("identity key already exists: %s", identityAbs)
 		} else if !os.IsNotExist(err) {
-			return SnapshotSummary{}, fmt.Errorf("stat identity key path: %w", err)
+			return result, fmt.Errorf("stat identity key path: %w", err)
 		}
-		recipient, err = crypto.GenerateIdentity(identityAbs)
-		if err != nil {
-			return SnapshotSummary{}, err
+		if dryRun {
+			summary.GeneratedIdentityPath = identityAbs
+			result.wouldGenerateIdentity = true
+			recipient = "dry-run-recipient"
+		} else {
+			recipient, err = crypto.GenerateIdentity(identityAbs)
+			if err != nil {
+				return result, err
+			}
+			summary.GeneratedIdentityPath = identityAbs
+			validationKeyPath = identityAbs
 		}
-		summary.GeneratedIdentityPath = identityAbs
-		validationKeyPath = identityAbs
 	}
 
 	kindByPath := map[string]string{}
@@ -99,7 +130,7 @@ func CreateSnapshot(opts SnapshotOptions) (SnapshotSummary, error) {
 	for _, composePath := range composeFiles {
 		parsed, err := compose.ParseFile(composePath)
 		if err != nil {
-			return SnapshotSummary{}, fmt.Errorf("parse compose file %s: %w", composePath, err)
+			return result, fmt.Errorf("parse compose file %s: %w", composePath, err)
 		}
 		for _, m := range parsed.Mentions {
 			if includeAsCapturedFile(m.Kind) {
@@ -145,17 +176,17 @@ func CreateSnapshot(opts SnapshotOptions) (SnapshotSummary, error) {
 	for _, p := range filePaths {
 		id := stableEntryID(p)
 		if _, ok := entryIDByPath[p]; ok {
-			return SnapshotSummary{}, fmt.Errorf("duplicate entry source path %s", p)
+			return result, fmt.Errorf("duplicate entry source path %s", p)
 		}
 		entryIDByPath[p] = id
 
 		sha, err := fileSHA256(p)
 		if err != nil {
-			return SnapshotSummary{}, fmt.Errorf("hash %s: %w", p, err)
+			return result, fmt.Errorf("hash %s: %w", p, err)
 		}
 		fi, err := os.Stat(p)
 		if err != nil {
-			return SnapshotSummary{}, fmt.Errorf("stat %s: %w", p, err)
+			return result, fmt.Errorf("stat %s: %w", p, err)
 		}
 		restoreRel, inRoot := pathmap.ComputeRestoreRelPath(rootAbs, p)
 		sourceRel := ""
@@ -193,7 +224,7 @@ func CreateSnapshot(opts SnapshotOptions) (SnapshotSummary, error) {
 
 	snapshotID, err := randomHex(12)
 	if err != nil {
-		return SnapshotSummary{}, err
+		return result, err
 	}
 	mf := manifest.Manifest{
 		PCIVersion:         manifest.CurrentPCIVersion,
@@ -205,7 +236,56 @@ func CreateSnapshot(opts SnapshotOptions) (SnapshotSummary, error) {
 		OutsideRootEntries: outsideIDs,
 	}
 	if err := mf.Validate(); err != nil {
-		return SnapshotSummary{}, fmt.Errorf("build manifest: %w", err)
+		return result, fmt.Errorf("build manifest: %w", err)
+	}
+
+	summary.CapturedFiles = len(entries)
+	summary.ExternalFiles = len(outsideIDs)
+	summary.SkippedMissing = skippedMissing
+	summary.Manifest = mf
+
+	result.summary = summary
+	result.entries = entries
+	result.recipient = recipient
+	result.validationKeyPath = validationKeyPath
+	return result, nil
+}
+
+func PlanSnapshot(opts SnapshotOptions) (SnapshotPlan, error) {
+	result, err := buildSnapshotPlan(opts, true)
+	if err != nil {
+		return SnapshotPlan{}, err
+	}
+	outAbs, err := filepath.Abs(opts.OutBundle)
+	if err != nil {
+		return SnapshotPlan{}, fmt.Errorf("resolve output bundle path: %w", err)
+	}
+
+	externalSet := result.summary.Manifest.OutsideRootSet()
+	externalEntries := make([]manifest.Entry, 0, len(externalSet))
+	for _, e := range result.entries {
+		if _, ok := externalSet[e.ID]; ok {
+			externalEntries = append(externalEntries, e)
+		}
+	}
+
+	return SnapshotPlan{
+		RootDir:               result.summary.Manifest.SourceRoot,
+		OutBundle:             outAbs,
+		ComposePaths:          append([]string(nil), result.composeFiles...),
+		Entries:               append([]manifest.Entry(nil), result.entries...),
+		ExternalEntries:       externalEntries,
+		SkippedMissing:        result.summary.SkippedMissing,
+		WouldGenerateIdentity: result.wouldGenerateIdentity,
+		IdentityPath:          result.summary.GeneratedIdentityPath,
+		Manifest:              result.summary.Manifest,
+	}, nil
+}
+
+func CreateSnapshot(opts SnapshotOptions) (SnapshotSummary, error) {
+	result, err := buildSnapshotPlan(opts, false)
+	if err != nil {
+		return SnapshotSummary{}, err
 	}
 
 	stage, err := os.MkdirTemp("", "infrakey-snapshot-")
@@ -218,14 +298,14 @@ func CreateSnapshot(opts SnapshotOptions) (SnapshotSummary, error) {
 	if err := os.MkdirAll(filepath.Join(payloadDir, "files"), 0o700); err != nil {
 		return SnapshotSummary{}, fmt.Errorf("create payload dir: %w", err)
 	}
-	for _, e := range entries {
+	for _, e := range result.entries {
 		src := e.SourceAbsPath
 		dst := filepath.Join(payloadDir, "files", e.ID)
 		if err := copyFile(src, dst); err != nil {
 			return SnapshotSummary{}, fmt.Errorf("stage entry %s: %w", e.ID, err)
 		}
 	}
-	if err := manifest.WriteToFile(filepath.Join(payloadDir, "manifest.pci.json"), mf); err != nil {
+	if err := manifest.WriteToFile(filepath.Join(payloadDir, "manifest.pci.json"), result.summary.Manifest); err != nil {
 		return SnapshotSummary{}, err
 	}
 
@@ -238,22 +318,18 @@ func CreateSnapshot(opts SnapshotOptions) (SnapshotSummary, error) {
 	if err != nil {
 		return SnapshotSummary{}, fmt.Errorf("resolve output bundle path: %w", err)
 	}
-	if err := crypto.EncryptFile(tarPath, outAbs, recipient); err != nil {
+	if err := crypto.EncryptFile(tarPath, outAbs, result.recipient); err != nil {
 		return SnapshotSummary{}, err
 	}
 
-	if validationKeyPath != "" {
+	if result.validationKeyPath != "" {
 		testDecryptPath := filepath.Join(stage, "validation.tar")
-		if err := crypto.DecryptFile(outAbs, validationKeyPath, testDecryptPath); err != nil {
+		if err := crypto.DecryptFile(outAbs, result.validationKeyPath, testDecryptPath); err != nil {
 			return SnapshotSummary{}, fmt.Errorf("post-encryption validation failed: %w", err)
 		}
 	}
 
-	summary.CapturedFiles = len(entries)
-	summary.ExternalFiles = len(outsideIDs)
-	summary.SkippedMissing = skippedMissing
-	summary.Manifest = mf
-	return summary, nil
+	return result.summary, nil
 }
 
 func includeAsCapturedFile(mentionKind string) bool {
@@ -285,17 +361,56 @@ func mergeEntryKind(existing, next string) string {
 		return next
 	}
 	priority := map[string]int{
-		manifest.KindCompose: 6,
-		manifest.KindCert:    5,
-		manifest.KindSecret:  4,
-		manifest.KindConfig:  3,
-		manifest.KindEnv:     2,
+		manifest.KindCompose:  6,
+		manifest.KindCert:     5,
+		manifest.KindSecret:   4,
+		manifest.KindConfig:   3,
+		manifest.KindEnv:      2,
 		manifest.KindExternal: 1,
 	}
 	if priority[next] > priority[existing] {
 		return next
 	}
 	return existing
+}
+
+func resolveComposeFiles(rootAbs string, selected []string) ([]string, error) {
+	if len(selected) == 0 {
+		return discovery.DiscoverComposeFiles(rootAbs)
+	}
+
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(selected))
+	for _, p := range selected {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			return nil, fmt.Errorf("resolve selected compose path %q: %w", p, err)
+		}
+		if !pathmap.IsInsideRoot(rootAbs, abs) {
+			return nil, fmt.Errorf("selected compose path outside root: %s", abs)
+		}
+		fi, err := os.Stat(abs)
+		if err != nil {
+			return nil, fmt.Errorf("stat selected compose path %q: %w", abs, err)
+		}
+		if !fi.Mode().IsRegular() {
+			return nil, fmt.Errorf("selected compose path is not a regular file: %s", abs)
+		}
+		if _, ok := seen[abs]; ok {
+			continue
+		}
+		seen[abs] = struct{}{}
+		out = append(out, abs)
+	}
+
+	sort.Strings(out)
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no compose files selected")
+	}
+	return out, nil
 }
 
 func addReplacementUnique(in []manifest.PathReplacement, repl manifest.PathReplacement) []manifest.PathReplacement {

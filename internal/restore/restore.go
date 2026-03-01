@@ -21,11 +21,11 @@ import (
 )
 
 type Options struct {
-	BundlePath       string
-	IdentityKeyPath  string
-	TargetDir        string
-	Yes              bool
-	IncludeExternal  string // "", "all", "none"
+	BundlePath      string
+	IdentityKeyPath string
+	TargetDir       string
+	Yes             bool
+	IncludeExternal string // "", "all", "none"
 }
 
 type Summary struct {
@@ -34,48 +34,82 @@ type Summary struct {
 	ExternalTotal   int
 }
 
-func Run(opts Options) (Summary, error) {
+type Plan struct {
+	TargetPath      string
+	RestoredEntries []manifest.Entry
+	SkippedExternal []manifest.Entry
+	Manifest        manifest.Manifest
+}
+
+type preparedRestore struct {
+	targetAbs       string
+	payloadDir      string
+	mf              manifest.Manifest
+	entryByID       map[string]manifest.Entry
+	outsideSet      map[string]struct{}
+	includeExternal map[string]bool
+	cleanup         func()
+}
+
+func validateOptions(opts Options) error {
 	if runtime.GOOS != "linux" {
-		return Summary{}, fmt.Errorf("linux-only MVP: current platform is %s", runtime.GOOS)
+		return fmt.Errorf("linux-only MVP: current platform is %s", runtime.GOOS)
 	}
 	if opts.Yes && opts.IncludeExternal == "" {
-		return Summary{}, fmt.Errorf("--yes requires --include-external all|none")
+		return fmt.Errorf("--yes requires --include-external all|none")
 	}
 	if opts.IncludeExternal != "" && opts.IncludeExternal != "all" && opts.IncludeExternal != "none" {
-		return Summary{}, fmt.Errorf("invalid --include-external value %q (expected all or none)", opts.IncludeExternal)
+		return fmt.Errorf("invalid --include-external value %q (expected all or none)", opts.IncludeExternal)
+	}
+	if opts.BundlePath == "" || opts.IdentityKeyPath == "" || opts.TargetDir == "" {
+		return fmt.Errorf("bundle, identity key and target are required")
+	}
+	return nil
+}
+
+func prepareRestore(opts Options) (preparedRestore, error) {
+	var prep preparedRestore
+	if err := validateOptions(opts); err != nil {
+		return prep, err
 	}
 
 	targetAbs, err := filepath.Abs(opts.TargetDir)
 	if err != nil {
-		return Summary{}, fmt.Errorf("resolve target path: %w", err)
+		return prep, fmt.Errorf("resolve target path: %w", err)
 	}
 	if err := ensureTargetEmptyOrAbsent(targetAbs); err != nil {
-		return Summary{}, err
+		return prep, err
 	}
 
 	workDir, err := os.MkdirTemp("", "infrakey-restore-")
 	if err != nil {
-		return Summary{}, fmt.Errorf("create temp dir: %w", err)
+		return prep, fmt.Errorf("create temp dir: %w", err)
 	}
-	defer os.RemoveAll(workDir)
+	cleanup := func() { _ = os.RemoveAll(workDir) }
+	cleanupNeeded := true
+	defer func() {
+		if cleanupNeeded {
+			cleanup()
+		}
+	}()
 
 	decryptedTar := filepath.Join(workDir, "payload.tar")
 	if err := crypto.DecryptFile(opts.BundlePath, opts.IdentityKeyPath, decryptedTar); err != nil {
-		return Summary{}, err
+		return prep, err
 	}
 
 	payloadDir := filepath.Join(workDir, "payload")
 	if err := os.MkdirAll(payloadDir, 0o700); err != nil {
-		return Summary{}, fmt.Errorf("create payload dir: %w", err)
+		return prep, fmt.Errorf("create payload dir: %w", err)
 	}
 	if err := bundle.ExtractTar(decryptedTar, payloadDir); err != nil {
-		return Summary{}, fmt.Errorf("extract payload: %w", err)
+		return prep, fmt.Errorf("extract payload: %w", err)
 	}
 
 	manifestPath := filepath.Join(payloadDir, "manifest.pci.json")
 	mf, err := manifest.ReadFromFile(manifestPath)
 	if err != nil {
-		return Summary{}, fmt.Errorf("load manifest: %w", err)
+		return prep, fmt.Errorf("load manifest: %w", err)
 	}
 
 	entryByID := make(map[string]manifest.Entry, len(mf.Entries))
@@ -84,16 +118,57 @@ func Run(opts Options) (Summary, error) {
 	}
 
 	if err := validatePayloadFiles(payloadDir, mf); err != nil {
-		return Summary{}, err
+		return prep, err
 	}
 
 	outsideSet := mf.OutsideRootSet()
 	includeExternal, err := decideExternalInclusion(mf, outsideSet, opts)
 	if err != nil {
-		return Summary{}, err
+		return prep, err
 	}
 
-	stagingDir, err := createStagingDir(targetAbs)
+	prep = preparedRestore{
+		targetAbs:       targetAbs,
+		payloadDir:      payloadDir,
+		mf:              mf,
+		entryByID:       entryByID,
+		outsideSet:      outsideSet,
+		includeExternal: includeExternal,
+		cleanup:         cleanup,
+	}
+	cleanupNeeded = false
+	return prep, nil
+}
+
+func PlanRestore(opts Options) (Plan, error) {
+	prep, err := prepareRestore(opts)
+	if err != nil {
+		return Plan{}, err
+	}
+	defer prep.cleanup()
+
+	plan := Plan{
+		TargetPath: prep.targetAbs,
+		Manifest:   prep.mf,
+	}
+	for _, e := range prep.mf.Entries {
+		if _, outside := prep.outsideSet[e.ID]; outside && !prep.includeExternal[e.ID] {
+			plan.SkippedExternal = append(plan.SkippedExternal, e)
+			continue
+		}
+		plan.RestoredEntries = append(plan.RestoredEntries, e)
+	}
+	return plan, nil
+}
+
+func Run(opts Options) (Summary, error) {
+	prep, err := prepareRestore(opts)
+	if err != nil {
+		return Summary{}, err
+	}
+	defer prep.cleanup()
+
+	stagingDir, err := createStagingDir(prep.targetAbs)
 	if err != nil {
 		return Summary{}, err
 	}
@@ -105,14 +180,14 @@ func Run(opts Options) (Summary, error) {
 	}()
 
 	skippedSources := map[string]struct{}{}
-	summary := Summary{ExternalTotal: len(outsideSet)}
-	for _, e := range mf.Entries {
-		if _, outside := outsideSet[e.ID]; outside && !includeExternal[e.ID] {
+	summary := Summary{ExternalTotal: len(prep.outsideSet)}
+	for _, e := range prep.mf.Entries {
+		if _, outside := prep.outsideSet[e.ID]; outside && !prep.includeExternal[e.ID] {
 			summary.SkippedExternal++
 			skippedSources[e.SourceAbsPath] = struct{}{}
 			continue
 		}
-		src := filepath.Join(payloadDir, "files", e.ID)
+		src := filepath.Join(prep.payloadDir, "files", e.ID)
 		dst, err := pathmap.TargetPath(stagingDir, e.RestoreRelPath)
 		if err != nil {
 			return Summary{}, fmt.Errorf("resolve restore path for entry %q: %w", e.ID, err)
@@ -133,11 +208,11 @@ func Run(opts Options) (Summary, error) {
 		summary.RestoredEntries++
 	}
 
-	if err := applyComposeRewrites(stagingDir, targetAbs, mf, entryByID, skippedSources); err != nil {
+	if err := applyComposeRewrites(stagingDir, prep.targetAbs, prep.mf, prep.entryByID, skippedSources); err != nil {
 		return Summary{}, err
 	}
 
-	if err := commitStaging(stagingDir, targetAbs); err != nil {
+	if err := commitStaging(stagingDir, prep.targetAbs); err != nil {
 		return Summary{}, err
 	}
 	committed = true

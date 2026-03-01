@@ -38,6 +38,16 @@ sudo apt update && sudo apt install -y age
 sudo ~/infrakey snapshot --root ~/docker-apps --out ~/vault.bundle --identity-out ~/identity.key
 ```
 
+When prompted for snapshot scope:
+- choose `All compose apps (...)` to capture everything
+- choose `Select compose apps manually` to move with arrow keys, toggle with space, confirm with enter
+
+Optional preflight (no writes):
+
+```bash
+sudo ~/infrakey dry-run snapshot --root ~/docker-apps --out ~/vault.bundle --identity-out ~/identity.key
+```
+
 ## 5) Inspect snapshot metadata
 
 ```bash
@@ -50,6 +60,12 @@ sudo ~/infrakey inspect --bundle ~/vault.bundle --identity-key ~/identity.key
 sudo rm -rf /tmp/infrakey-restore-test
 sudo ~/infrakey restore --bundle ~/vault.bundle --identity-key ~/identity.key --target /tmp/infrakey-restore-test --yes --include-external none
 sudo find /tmp/infrakey-restore-test -maxdepth 4 -type f | sort
+```
+
+Optional preflight (no writes):
+
+```bash
+sudo ~/infrakey dry-run restore --bundle ~/vault.bundle --identity-key ~/identity.key --target /tmp/infrakey-restore-test --yes --include-external none
 ```
 
 ## 7) Validate restored compose files
