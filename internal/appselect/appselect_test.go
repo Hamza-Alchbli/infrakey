@@ -38,7 +38,7 @@ func TestDiscoverAppEstimates(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := Discover(root)
+	got, err := Discover(root, Options{})
 	if err != nil {
 		t.Fatalf("Discover error: %v", err)
 	}
@@ -67,6 +67,37 @@ func TestDiscoverAppEstimates(t *testing.T) {
 	totalExpected := fileSize(t, pathA) + fileSize(t, pathB) + fileSize(t, immichEnv) + fileSize(t, sharedSecret)
 	if got.TotalEstimatedSizeBytes != totalExpected {
 		t.Fatalf("total estimate mismatch: got %d want %d", got.TotalEstimatedSizeBytes, totalExpected)
+	}
+}
+
+func TestDiscoverIncludesVolumeDirWhenRequested(t *testing.T) {
+	root := t.TempDir()
+	appDir := filepath.Join(root, "immich")
+	if err := os.MkdirAll(filepath.Join(appDir, "data"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "data", "blob.bin"), make([]byte, 4096), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	compose := "services:\n  app:\n    image: alpine\n    volumes:\n      - ./data:/data\n"
+	composePath := filepath.Join(appDir, "docker-compose.yml")
+	if err := os.WriteFile(composePath, []byte(compose), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	withoutVolumes, err := Discover(root, Options{IncludeVolumes: false})
+	if err != nil {
+		t.Fatalf("Discover without volumes error: %v", err)
+	}
+	withVolumes, err := Discover(root, Options{IncludeVolumes: true})
+	if err != nil {
+		t.Fatalf("Discover with volumes error: %v", err)
+	}
+	if len(withVolumes.Apps) != 1 || len(withoutVolumes.Apps) != 1 {
+		t.Fatalf("unexpected app count")
+	}
+	if withVolumes.Apps[0].EstimatedSizeBytes <= withoutVolumes.Apps[0].EstimatedSizeBytes {
+		t.Fatalf("expected volume-inclusive estimate to be larger")
 	}
 }
 

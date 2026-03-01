@@ -9,9 +9,10 @@ Included:
 - Referenced `env_file` files
 - `secrets.*.file` and `configs.*.file` files
 - Cert-like paths from compose `environment` values (`.pem`, `.crt`, `.key`, `.p12`) when file exists
+- Optional full-copy capture of full compose project directories and bind-mounted volume sources (`--full-copy`)
 
 Excluded:
-- Docker volumes/data blobs/media libraries
+- Docker named volumes (not yet captured in this mode)
 - Docker images
 - Runtime container/network state
 
@@ -35,12 +36,16 @@ Future-ready targets are also available: `make bin`, `make bin-linux-arm64`, `ma
 ## Commands
 
 ```bash
-infrakey snapshot --root <dir> --out <vault.bundle> [--recipient <age-pubkey>] [--identity-out <identity.key>]
+infrakey snapshot --root <dir> --out <vault.bundle> [--recipient <age-pubkey>] [--identity-out <identity.key>] [--full-copy] [--chunk-size <size>]
 infrakey restore --bundle <vault.bundle> --identity-key <identity.key> --target <dir> [--yes] [--include-external all|none]
 infrakey inspect --bundle <vault.bundle> --identity-key <identity.key>
-infrakey dry-run snapshot --root <dir> --out <vault.bundle> [--recipient <age-pubkey>] [--identity-out <identity.key>]
+infrakey dry-run snapshot --root <dir> --out <vault.bundle> [--recipient <age-pubkey>] [--identity-out <identity.key>] [--full-copy] [--chunk-size <size>]
 infrakey dry-run restore --bundle <vault.bundle> --identity-key <identity.key> --target <dir> [--yes] [--include-external all|none]
 ```
+
+Extended snapshot flags:
+- `--full-copy` include full compose project directories plus bind-mounted compose volume sources (files/directories)
+- `--chunk-size <size>` split encrypted output into chunk files (example: `2GB`)
 
 `dry-run` commands execute discovery/validation/decryption and print planned actions, but do not write output bundles, keys, or restore targets.
 
@@ -54,7 +59,9 @@ infrakey dry-run restore --bundle <vault.bundle> --identity-key <identity.key> -
 - If snapshot is generating a key (no `--recipient`), CLI prints a security notice and warns when key and bundle are in the same directory.
 - Generates `manifest.pci.json` (`pciVersion: 0.1`)
 - Encrypts a deterministic tar payload into `vault.bundle`
+- In full-copy mode, default chunking is `2GB` (example outputs: `vault.bundle.parts/part0001`, `vault.bundle.parts/part0002`)
 - If no recipient is passed, generates an identity key and derives recipient from it
+- For chunked output, keep using the base bundle path (`--bundle ~/vault.bundle`) for `inspect` and `restore`.
 
 ## Restore behavior
 

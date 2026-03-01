@@ -26,7 +26,16 @@ type Options struct {
 	TargetDir       string
 	Yes             bool
 	IncludeExternal string // "", "all", "none"
+	Progress        ProgressFunc
 }
+
+type ProgressEvent struct {
+	Stage      string
+	BytesDone  int64
+	BytesTotal int64
+}
+
+type ProgressFunc func(ProgressEvent)
 
 type Summary struct {
 	RestoredEntries int
@@ -93,16 +102,25 @@ func prepareRestore(opts Options) (preparedRestore, error) {
 		}
 	}()
 
-	decryptedTar := filepath.Join(workDir, "payload.tar")
-	if err := crypto.DecryptFile(opts.BundlePath, opts.IdentityKeyPath, decryptedTar); err != nil {
+	bundleReader, _, err := bundle.OpenBundleReader(opts.BundlePath)
+	if err != nil {
 		return prep, err
 	}
+	defer bundleReader.Close()
 
 	payloadDir := filepath.Join(workDir, "payload")
 	if err := os.MkdirAll(payloadDir, 0o700); err != nil {
 		return prep, fmt.Errorf("create payload dir: %w", err)
 	}
-	if err := bundle.ExtractTar(decryptedTar, payloadDir); err != nil {
+	reportRestoreProgress(opts.Progress, "decrypting", 0, 0)
+	extractDone := int64(0)
+	reportRestoreProgress(opts.Progress, "extracting", extractDone, 0)
+	if err := crypto.DecryptFromReader(bundleReader, opts.IdentityKeyPath, func(r io.Reader) error {
+		return bundle.ExtractTarReaderWithProgress(r, payloadDir, func(n int64) {
+			extractDone += n
+			reportRestoreProgress(opts.Progress, "extracting", extractDone, 0)
+		})
+	}); err != nil {
 		return prep, fmt.Errorf("extract payload: %w", err)
 	}
 
@@ -117,7 +135,7 @@ func prepareRestore(opts Options) (preparedRestore, error) {
 		entryByID[e.ID] = e
 	}
 
-	if err := validatePayloadFiles(payloadDir, mf); err != nil {
+	if err := validateManifestPaths(mf); err != nil {
 		return prep, err
 	}
 
@@ -181,6 +199,18 @@ func Run(opts Options) (Summary, error) {
 
 	skippedSources := map[string]struct{}{}
 	summary := Summary{ExternalTotal: len(prep.outsideSet)}
+	totalBytes := int64(0)
+	for _, e := range prep.mf.Entries {
+		if _, outside := prep.outsideSet[e.ID]; outside && !prep.includeExternal[e.ID] {
+			continue
+		}
+		src := filepath.Join(prep.payloadDir, "files", e.ID)
+		if fi, err := os.Stat(src); err == nil && fi.Mode().IsRegular() {
+			totalBytes += fi.Size()
+		}
+	}
+	doneBytes := int64(0)
+	reportRestoreProgress(opts.Progress, "restoring", doneBytes, totalBytes)
 	for _, e := range prep.mf.Entries {
 		if _, outside := prep.outsideSet[e.ID]; outside && !prep.includeExternal[e.ID] {
 			summary.SkippedExternal++
@@ -192,18 +222,48 @@ func Run(opts Options) (Summary, error) {
 		if err != nil {
 			return Summary{}, fmt.Errorf("resolve restore path for entry %q: %w", e.ID, err)
 		}
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			return Summary{}, fmt.Errorf("mkdir restore dir for %q: %w", e.ID, err)
-		}
-		if err := copyFile(src, dst); err != nil {
-			return Summary{}, fmt.Errorf("restore entry %q: %w", e.ID, err)
-		}
 		mode, err := parseMode(e.Mode)
 		if err != nil {
 			return Summary{}, fmt.Errorf("invalid mode for entry %q: %w", e.ID, err)
 		}
-		if err := os.Chmod(dst, mode); err != nil {
-			return Summary{}, fmt.Errorf("chmod restored entry %q: %w", e.ID, err)
+
+		switch e.EffectiveDataFormat() {
+		case manifest.DataFormatRaw:
+			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+				return Summary{}, fmt.Errorf("mkdir restore dir for %q: %w", e.ID, err)
+			}
+			_, sum, err := copyFileWithProgressAndHash(src, dst, func(n int64) {
+				doneBytes += n
+				reportRestoreProgress(opts.Progress, "restoring", doneBytes, totalBytes)
+			})
+			if err != nil {
+				return Summary{}, fmt.Errorf("restore entry %q: %w", e.ID, err)
+			}
+			if sum != e.SHA256 {
+				return Summary{}, fmt.Errorf("checksum mismatch for entry %q", e.ID)
+			}
+			if err := os.Chmod(dst, mode); err != nil {
+				return Summary{}, fmt.Errorf("chmod restored entry %q: %w", e.ID, err)
+			}
+		case manifest.DataFormatTarDir:
+			if err := os.MkdirAll(dst, mode); err != nil {
+				return Summary{}, fmt.Errorf("mkdir restore directory for %q: %w", e.ID, err)
+			}
+			sum, err := extractTarFileWithProgressAndHash(src, dst, func(n int64) {
+				doneBytes += n
+				reportRestoreProgress(opts.Progress, "restoring", doneBytes, totalBytes)
+			})
+			if err != nil {
+				return Summary{}, fmt.Errorf("restore directory entry %q: %w", e.ID, err)
+			}
+			if sum != e.SHA256 {
+				return Summary{}, fmt.Errorf("checksum mismatch for directory entry %q", e.ID)
+			}
+			if err := os.Chmod(dst, mode); err != nil {
+				return Summary{}, fmt.Errorf("chmod restored directory %q: %w", e.ID, err)
+			}
+		default:
+			return Summary{}, fmt.Errorf("unsupported data format for entry %q: %s", e.ID, e.DataFormat)
 		}
 		summary.RestoredEntries++
 	}
@@ -220,21 +280,13 @@ func Run(opts Options) (Summary, error) {
 	return summary, nil
 }
 
-func validatePayloadFiles(payloadDir string, mf manifest.Manifest) error {
+func validateManifestPaths(mf manifest.Manifest) error {
 	seenRestore := map[string]struct{}{}
 	for _, e := range mf.Entries {
 		if _, ok := seenRestore[e.RestoreRelPath]; ok {
 			return fmt.Errorf("manifest has duplicate restoreRelPath %q", e.RestoreRelPath)
 		}
 		seenRestore[e.RestoreRelPath] = struct{}{}
-		src := filepath.Join(payloadDir, "files", e.ID)
-		sum, err := fileSHA256(src)
-		if err != nil {
-			return fmt.Errorf("hash payload entry %q: %w", e.ID, err)
-		}
-		if sum != e.SHA256 {
-			return fmt.Errorf("checksum mismatch for entry %q", e.ID)
-		}
 	}
 	return nil
 }
@@ -349,7 +401,8 @@ func createStagingDir(targetAbs string) (string, error) {
 		return "", err
 	}
 	stage := filepath.Join(parent, ".infrakey-staging-"+randSuffix)
-	if err := os.MkdirAll(stage, 0o700); err != nil {
+	// Keep target root traversable after atomic rename (common sudo restore case).
+	if err := os.MkdirAll(stage, 0o755); err != nil {
 		return "", fmt.Errorf("create staging dir: %w", err)
 	}
 	return stage, nil
@@ -370,33 +423,54 @@ func commitStaging(stagingDir, targetAbs string) error {
 }
 
 func copyFile(src, dst string) error {
+	_, _, err := copyFileWithProgressAndHash(src, dst, nil)
+	return err
+}
+
+func copyFileWithProgress(src, dst string, onDelta func(int64)) (int64, error) {
+	written, _, err := copyFileWithProgressAndHash(src, dst, onDelta)
+	return written, err
+}
+
+func copyFileWithProgressAndHash(src, dst string, onDelta func(int64)) (int64, string, error) {
 	in, err := os.Open(src)
 	if err != nil {
-		return err
+		return 0, "", err
 	}
 	defer in.Close()
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
-		return err
+		return 0, "", err
 	}
-	if _, err := io.Copy(out, in); err != nil {
+	hasher := sha256.New()
+	w := io.MultiWriter(out, hasher)
+	buf := make([]byte, 1024*1024)
+	written, err := io.CopyBuffer(w, in, buf)
+	if err != nil {
 		out.Close()
-		return err
+		return 0, "", err
 	}
-	return out.Close()
+	if onDelta != nil && written > 0 {
+		onDelta(written)
+	}
+	if err := out.Close(); err != nil {
+		return written, "", err
+	}
+	return written, hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
-func fileSHA256(path string) (string, error) {
-	f, err := os.Open(path)
+func extractTarFileWithProgressAndHash(src, dst string, onDelta func(int64)) (string, error) {
+	f, err := os.Open(src)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	hasher := sha256.New()
+	tee := io.TeeReader(f, hasher)
+	if err := bundle.ExtractTarReaderWithProgress(tee, dst, onDelta); err != nil {
 		return "", err
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
 func parseMode(mode string) (os.FileMode, error) {
@@ -413,4 +487,15 @@ func randomHex(bytesN int) (string, error) {
 		return "", fmt.Errorf("read randomness: %w", err)
 	}
 	return hex.EncodeToString(b), nil
+}
+
+func reportRestoreProgress(fn ProgressFunc, stage string, done, total int64) {
+	if fn == nil {
+		return
+	}
+	fn(ProgressEvent{
+		Stage:      stage,
+		BytesDone:  done,
+		BytesTotal: total,
+	})
 }

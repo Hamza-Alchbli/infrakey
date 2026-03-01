@@ -2,6 +2,8 @@ package bundle
 
 import (
 	"archive/tar"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"io/fs"
@@ -21,11 +23,16 @@ func CreateDeterministicTar(srcDir, outTarPath string) error {
 	}
 	defer f.Close()
 
-	tw := tar.NewWriter(f)
+	return CreateDeterministicTarToWriter(srcDir, f)
+}
+
+func CreateDeterministicTarToWriter(srcDir string, w io.Writer) error {
+	tw := tar.NewWriter(w)
 	defer tw.Close()
+	copyBuf := make([]byte, 1024*1024)
 
 	var paths []string
-	err = filepath.WalkDir(srcDir, func(path string, d fs.DirEntry, walkErr error) error {
+	err := filepath.WalkDir(srcDir, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -81,7 +88,7 @@ func CreateDeterministicTar(srcDir, outTarPath string) error {
 			if err != nil {
 				return fmt.Errorf("open %s: %w", absPath, err)
 			}
-			if _, err := io.Copy(tw, in); err != nil {
+			if _, err := io.CopyBuffer(tw, in, copyBuf); err != nil {
 				in.Close()
 				return fmt.Errorf("write tar body %s: %w", absPath, err)
 			}
@@ -93,14 +100,34 @@ func CreateDeterministicTar(srcDir, outTarPath string) error {
 	return nil
 }
 
+func HashDeterministicTar(srcDir string) (string, error) {
+	h := sha256.New()
+	if err := CreateDeterministicTarToWriter(srcDir, h); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 func ExtractTar(tarPath, dest string) error {
+	return ExtractTarWithProgress(tarPath, dest, nil)
+}
+
+func ExtractTarWithProgress(tarPath, dest string, onDelta func(int64)) error {
 	f, err := os.Open(tarPath)
 	if err != nil {
 		return fmt.Errorf("open tar: %w", err)
 	}
 	defer f.Close()
+	return ExtractTarReaderWithProgress(f, dest, onDelta)
+}
 
-	tr := tar.NewReader(f)
+func ExtractTarReaderWithProgress(r io.Reader, dest string, onDelta func(int64)) error {
+	var reader io.Reader = r
+	if onDelta != nil {
+		reader = &countingReader{r: r, onDelta: onDelta}
+	}
+	tr := tar.NewReader(reader)
+	copyBuf := make([]byte, 1024*1024)
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -132,7 +159,7 @@ func ExtractTar(tarPath, dest string) error {
 			if err != nil {
 				return fmt.Errorf("create %s: %w", target, err)
 			}
-			if _, err := io.Copy(out, tr); err != nil {
+			if _, err := io.CopyBuffer(out, tr, copyBuf); err != nil {
 				out.Close()
 				return fmt.Errorf("write %s: %w", target, err)
 			}
@@ -145,4 +172,17 @@ func ExtractTar(tarPath, dest string) error {
 	}
 
 	return nil
+}
+
+type countingReader struct {
+	r       io.Reader
+	onDelta func(int64)
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if n > 0 && c.onDelta != nil {
+		c.onDelta(int64(n))
+	}
+	return n, err
 }

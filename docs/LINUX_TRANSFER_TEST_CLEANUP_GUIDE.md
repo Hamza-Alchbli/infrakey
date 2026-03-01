@@ -38,6 +38,14 @@ sudo apt update && sudo apt install -y age
 sudo ~/infrakey snapshot --root ~/docker-apps --out ~/vault.bundle --identity-out ~/identity.key
 ```
 
+Optional full-copy snapshot with chunking:
+
+```bash
+sudo ~/infrakey snapshot --root ~/docker-apps --out ~/vault.bundle --identity-out ~/identity.key --full-copy --chunk-size 2GB
+```
+
+`--full-copy` captures full compose project directories plus bind-mounted volume sources.
+
 When prompted for snapshot scope:
 - choose `All compose apps (...)` to capture everything
 - choose `Select compose apps manually` to move with arrow keys, toggle with space, confirm with enter

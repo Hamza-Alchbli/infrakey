@@ -22,18 +22,32 @@ import (
 )
 
 type SnapshotOptions struct {
-	RootDir      string
-	OutBundle    string
-	Recipient    string
-	IdentityOut  string
-	ComposePaths []string
+	RootDir        string
+	OutBundle      string
+	Recipient      string
+	IdentityOut    string
+	ComposePaths   []string
+	FullCopy       bool
+	ChunkSizeBytes int64
+	Progress       ProgressFunc
 }
+
+type ProgressEvent struct {
+	Stage      string
+	BytesDone  int64
+	BytesTotal int64
+}
+
+type ProgressFunc func(ProgressEvent)
 
 type SnapshotSummary struct {
 	ComposeFiles          int
 	CapturedFiles         int
 	ExternalFiles         int
 	SkippedMissing        int
+	Chunked               bool
+	ChunkCount            int
+	ChunkPaths            []string
 	Manifest              manifest.Manifest
 	GeneratedIdentityPath string
 }
@@ -57,6 +71,12 @@ type snapshotBuildResult struct {
 	recipient             string
 	validationKeyPath     string
 	wouldGenerateIdentity bool
+}
+
+type sourceMeta struct {
+	kind  string
+	mode  os.FileMode
+	isDir bool
 }
 
 func buildSnapshotPlan(opts SnapshotOptions, dryRun bool) (snapshotBuildResult, error) {
@@ -120,9 +140,32 @@ func buildSnapshotPlan(opts SnapshotOptions, dryRun bool) (snapshotBuildResult, 
 		}
 	}
 
-	kindByPath := map[string]string{}
+	sources := map[string]sourceMeta{}
 	for _, p := range composeFiles {
-		kindByPath[p] = manifest.KindCompose
+		fi, err := os.Stat(p)
+		if err != nil {
+			return result, fmt.Errorf("stat compose file %s: %w", p, err)
+		}
+		if !fi.Mode().IsRegular() {
+			return result, fmt.Errorf("compose path is not a regular file: %s", p)
+		}
+		if err := registerCapturedSource(sources, p, manifest.KindCompose, fi); err != nil {
+			return result, err
+		}
+
+		if opts.FullCopy {
+			projectDir := filepath.Dir(p)
+			dirInfo, err := os.Stat(projectDir)
+			if err != nil {
+				return result, fmt.Errorf("stat compose project dir %s: %w", projectDir, err)
+			}
+			if !dirInfo.IsDir() {
+				return result, fmt.Errorf("compose project path is not a directory: %s", projectDir)
+			}
+			if err := registerCapturedSource(sources, projectDir, manifest.KindVolume, dirInfo); err != nil {
+				return result, err
+			}
+		}
 	}
 
 	composeRewritesByPath := map[string][]manifest.PathReplacement{}
@@ -133,21 +176,28 @@ func buildSnapshotPlan(opts SnapshotOptions, dryRun bool) (snapshotBuildResult, 
 			return result, fmt.Errorf("parse compose file %s: %w", composePath, err)
 		}
 		for _, m := range parsed.Mentions {
-			if includeAsCapturedFile(m.Kind) {
+			if includeAsCapturedFile(m.Kind, opts.FullCopy) {
 				fi, err := os.Stat(m.ResolvedAbs)
 				if err != nil {
 					skippedMissing++
 					continue
 				}
-				if !fi.Mode().IsRegular() {
+				isDir := fi.IsDir()
+				isRegular := fi.Mode().IsRegular()
+				if isDir {
+					if !(opts.FullCopy && m.Kind == compose.MentionVolume) {
+						continue
+					}
+				} else if !isRegular {
 					continue
 				}
 				entryKind := kindFromMention(m.Kind)
 				if !pathmap.IsInsideRoot(rootAbs, m.ResolvedAbs) {
 					entryKind = manifest.KindExternal
 				}
-				existing := kindByPath[m.ResolvedAbs]
-				kindByPath[m.ResolvedAbs] = mergeEntryKind(existing, entryKind)
+				if err := registerCapturedSource(sources, m.ResolvedAbs, entryKind, fi); err != nil {
+					return result, err
+				}
 			}
 
 			if !m.OriginalAbsolute {
@@ -164,8 +214,8 @@ func buildSnapshotPlan(opts SnapshotOptions, dryRun bool) (snapshotBuildResult, 
 		}
 	}
 
-	filePaths := make([]string, 0, len(kindByPath))
-	for p := range kindByPath {
+	filePaths := make([]string, 0, len(sources))
+	for p := range sources {
 		filePaths = append(filePaths, p)
 	}
 	sort.Strings(filePaths)
@@ -179,14 +229,23 @@ func buildSnapshotPlan(opts SnapshotOptions, dryRun bool) (snapshotBuildResult, 
 			return result, fmt.Errorf("duplicate entry source path %s", p)
 		}
 		entryIDByPath[p] = id
+		meta := sources[p]
 
-		sha, err := fileSHA256(p)
-		if err != nil {
-			return result, fmt.Errorf("hash %s: %w", p, err)
-		}
-		fi, err := os.Stat(p)
-		if err != nil {
-			return result, fmt.Errorf("stat %s: %w", p, err)
+		sha := ""
+		if meta.isDir {
+			if dryRun {
+				sha, err = HashDeterministicTar(p)
+				if err != nil {
+					return result, fmt.Errorf("hash directory %s: %w", p, err)
+				}
+			} else {
+				sha = "pending"
+			}
+		} else {
+			sha, err = fileSHA256(p)
+			if err != nil {
+				return result, fmt.Errorf("hash %s: %w", p, err)
+			}
 		}
 		restoreRel, inRoot := pathmap.ComputeRestoreRelPath(rootAbs, p)
 		sourceRel := ""
@@ -198,15 +257,20 @@ func buildSnapshotPlan(opts SnapshotOptions, dryRun bool) (snapshotBuildResult, 
 		} else {
 			outsideIDs = append(outsideIDs, id)
 		}
-		entries = append(entries, manifest.Entry{
+		entry := manifest.Entry{
 			ID:             id,
-			Kind:           kindByPath[p],
+			Kind:           meta.kind,
 			SourceAbsPath:  p,
 			SourceRelPath:  sourceRel,
 			RestoreRelPath: restoreRel,
 			SHA256:         sha,
-			Mode:           fmt.Sprintf("%04o", fi.Mode().Perm()),
-		})
+			Mode:           fmt.Sprintf("%04o", meta.mode.Perm()),
+		}
+		if meta.isDir {
+			entry.EntryType = manifest.EntryTypeDirectory
+			entry.DataFormat = manifest.DataFormatTarDir
+		}
+		entries = append(entries, entry)
 	}
 
 	composeRewrites := make([]manifest.ComposeRewrite, 0, len(composeRewritesByPath))
@@ -288,9 +352,18 @@ func CreateSnapshot(opts SnapshotOptions) (SnapshotSummary, error) {
 		return SnapshotSummary{}, err
 	}
 
-	stage, err := os.MkdirTemp("", "infrakey-snapshot-")
+	outAbs, err := filepath.Abs(opts.OutBundle)
 	if err != nil {
-		return SnapshotSummary{}, fmt.Errorf("create snapshot temp dir: %w", err)
+		return SnapshotSummary{}, fmt.Errorf("resolve output bundle path: %w", err)
+	}
+	outDir := filepath.Dir(outAbs)
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return SnapshotSummary{}, fmt.Errorf("create output directory: %w", err)
+	}
+
+	stage, err := os.MkdirTemp(outDir, ".infrakey-snapshot-")
+	if err != nil {
+		return SnapshotSummary{}, fmt.Errorf("create snapshot temp dir in output directory: %w", err)
 	}
 	defer os.RemoveAll(stage)
 
@@ -298,47 +371,166 @@ func CreateSnapshot(opts SnapshotOptions) (SnapshotSummary, error) {
 	if err := os.MkdirAll(filepath.Join(payloadDir, "files"), 0o700); err != nil {
 		return SnapshotSummary{}, fmt.Errorf("create payload dir: %w", err)
 	}
+
+	manifestIndexByID := make(map[string]int, len(result.summary.Manifest.Entries))
+	for i, e := range result.summary.Manifest.Entries {
+		manifestIndexByID[e.ID] = i
+	}
+
+	stageTotal := int64(0)
+	stageDone := int64(0)
+	for _, e := range result.entries {
+		n, err := estimateStageBytes(e)
+		if err == nil {
+			stageTotal += n
+		}
+	}
+	reportSnapshotProgress(opts.Progress, "staging", stageDone, stageTotal)
+
 	for _, e := range result.entries {
 		src := e.SourceAbsPath
 		dst := filepath.Join(payloadDir, "files", e.ID)
-		if err := copyFile(src, dst); err != nil {
-			return SnapshotSummary{}, fmt.Errorf("stage entry %s: %w", e.ID, err)
+		switch e.EffectiveDataFormat() {
+		case manifest.DataFormatRaw:
+			_, err := copyFileWithProgress(src, dst, func(n int64) {
+				stageDone += n
+				reportSnapshotProgress(opts.Progress, "staging", stageDone, stageTotal)
+			})
+			if err != nil {
+				return SnapshotSummary{}, fmt.Errorf("stage entry %s: %w", e.ID, err)
+			}
+		case manifest.DataFormatTarDir:
+			written, sha, err := createDeterministicTarFileWithProgress(src, dst, func(n int64) {
+				stageDone += n
+				reportSnapshotProgress(opts.Progress, "staging", stageDone, stageTotal)
+			})
+			if err != nil {
+				return SnapshotSummary{}, fmt.Errorf("stage directory entry %s: %w", e.ID, err)
+			}
+			_ = written
+			for i := range result.entries {
+				if result.entries[i].ID == e.ID {
+					result.entries[i].SHA256 = sha
+					break
+				}
+			}
+			if idx, ok := manifestIndexByID[e.ID]; ok {
+				result.summary.Manifest.Entries[idx].SHA256 = sha
+			}
+		default:
+			return SnapshotSummary{}, fmt.Errorf("unsupported data format for entry %s: %s", e.ID, e.DataFormat)
 		}
+	}
+	if err := result.summary.Manifest.Validate(); err != nil {
+		return SnapshotSummary{}, fmt.Errorf("manifest validation after staging: %w", err)
 	}
 	if err := manifest.WriteToFile(filepath.Join(payloadDir, "manifest.pci.json"), result.summary.Manifest); err != nil {
 		return SnapshotSummary{}, err
 	}
 
 	tarPath := filepath.Join(stage, "payload.tar")
-	if err := CreateDeterministicTar(payloadDir, tarPath); err != nil {
+	reportSnapshotProgress(opts.Progress, "packaging", 0, 0)
+	packDone := int64(0)
+	if _, _, err := createDeterministicTarFileWithProgress(payloadDir, tarPath, func(n int64) {
+		packDone += n
+		reportSnapshotProgress(opts.Progress, "packaging", packDone, 0)
+	}); err != nil {
 		return SnapshotSummary{}, err
 	}
 
-	outAbs, err := filepath.Abs(opts.OutBundle)
-	if err != nil {
-		return SnapshotSummary{}, fmt.Errorf("resolve output bundle path: %w", err)
-	}
+	reportSnapshotProgress(opts.Progress, "encrypting", 0, 0)
 	if err := crypto.EncryptFile(tarPath, outAbs, result.recipient); err != nil {
 		return SnapshotSummary{}, err
 	}
 
 	if result.validationKeyPath != "" {
-		testDecryptPath := filepath.Join(stage, "validation.tar")
-		if err := crypto.DecryptFile(outAbs, result.validationKeyPath, testDecryptPath); err != nil {
+		reportSnapshotProgress(opts.Progress, "validating", 0, 0)
+		if err := crypto.DecryptToDiscard(outAbs, result.validationKeyPath); err != nil {
 			return SnapshotSummary{}, fmt.Errorf("post-encryption validation failed: %w", err)
 		}
 	}
 
-	return result.summary, nil
+	summary := result.summary
+	summary.Chunked = false
+	summary.ChunkCount = 1
+	summary.ChunkPaths = []string{outAbs}
+	if opts.ChunkSizeBytes > 0 {
+		reportSnapshotProgress(opts.Progress, "chunking", 0, 0)
+		chunkDone := int64(0)
+		chunks, err := SplitBundleIntoChunksWithProgress(outAbs, opts.ChunkSizeBytes, func(n int64) {
+			chunkDone += n
+			reportSnapshotProgress(opts.Progress, "chunking", chunkDone, 0)
+		})
+		if err != nil {
+			return SnapshotSummary{}, fmt.Errorf("chunk encrypted bundle: %w", err)
+		}
+		summary.ChunkCount = len(chunks)
+		summary.ChunkPaths = summary.ChunkPaths[:0]
+		for _, c := range chunks {
+			summary.ChunkPaths = append(summary.ChunkPaths, c.Path)
+		}
+		if len(chunks) > 1 {
+			summary.Chunked = true
+		}
+	}
+	if err := writeInspectSidecar(outAbs, summary.Chunked, summary.Manifest, result.recipient); err != nil {
+		return SnapshotSummary{}, err
+	}
+
+	return summary, nil
 }
 
-func includeAsCapturedFile(mentionKind string) bool {
+func includeAsCapturedFile(mentionKind string, fullCopy bool) bool {
 	switch mentionKind {
 	case compose.MentionEnvFile, compose.MentionSecret, compose.MentionConfig, compose.MentionCert:
 		return true
+	case compose.MentionVolume:
+		return fullCopy
 	default:
 		return false
 	}
+}
+
+func estimateStageBytes(e manifest.Entry) (int64, error) {
+	switch e.EffectiveDataFormat() {
+	case manifest.DataFormatRaw:
+		fi, err := os.Stat(e.SourceAbsPath)
+		if err != nil {
+			return 0, err
+		}
+		if !fi.Mode().IsRegular() {
+			return 0, nil
+		}
+		return fi.Size(), nil
+	case manifest.DataFormatTarDir:
+		return estimateDirRegularBytes(e.SourceAbsPath)
+	default:
+		return 0, nil
+	}
+}
+
+func estimateDirRegularBytes(root string) (int64, error) {
+	var total int64
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if info.Mode().IsRegular() {
+			total += info.Size()
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return total, nil
 }
 
 func kindFromMention(mentionKind string) string {
@@ -351,6 +543,8 @@ func kindFromMention(mentionKind string) string {
 		return manifest.KindConfig
 	case compose.MentionCert:
 		return manifest.KindCert
+	case compose.MentionVolume:
+		return manifest.KindVolume
 	default:
 		return manifest.KindExternal
 	}
@@ -365,6 +559,7 @@ func mergeEntryKind(existing, next string) string {
 		manifest.KindCert:     5,
 		manifest.KindSecret:   4,
 		manifest.KindConfig:   3,
+		manifest.KindVolume:   2,
 		manifest.KindEnv:      2,
 		manifest.KindExternal: 1,
 	}
@@ -372,6 +567,26 @@ func mergeEntryKind(existing, next string) string {
 		return next
 	}
 	return existing
+}
+
+func registerCapturedSource(sources map[string]sourceMeta, path, kind string, fi os.FileInfo) error {
+	isDir := fi.IsDir()
+	existing, ok := sources[path]
+	if !ok {
+		sources[path] = sourceMeta{
+			kind:  kind,
+			mode:  fi.Mode(),
+			isDir: isDir,
+		}
+		return nil
+	}
+	if existing.isDir != isDir {
+		return fmt.Errorf("path is referenced as both file and directory: %s", path)
+	}
+	existing.kind = mergeEntryKind(existing.kind, kind)
+	existing.mode = fi.Mode()
+	sources[path] = existing
+	return nil
 }
 
 func resolveComposeFiles(rootAbs string, selected []string) ([]string, error) {
@@ -441,20 +656,33 @@ func fileSHA256(path string) (string, error) {
 }
 
 func copyFile(src, dst string) error {
+	_, err := copyFileWithProgress(src, dst, nil)
+	return err
+}
+
+func copyFileWithProgress(src, dst string, onDelta func(int64)) (int64, error) {
 	in, err := os.Open(src)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer in.Close()
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	if _, err := io.Copy(out, in); err != nil {
+	buf := make([]byte, 1024*1024)
+	written, err := io.CopyBuffer(out, in, buf)
+	if err != nil {
 		out.Close()
-		return err
+		return 0, err
 	}
-	return out.Close()
+	if onDelta != nil && written > 0 {
+		onDelta(written)
+	}
+	if err := out.Close(); err != nil {
+		return written, err
+	}
+	return written, nil
 }
 
 func randomHex(n int) (string, error) {
@@ -463,4 +691,50 @@ func randomHex(n int) (string, error) {
 		return "", fmt.Errorf("read randomness: %w", err)
 	}
 	return hex.EncodeToString(b), nil
+}
+
+func createDeterministicTarFileWithProgress(srcDir, outTarPath string, onDelta func(int64)) (int64, string, error) {
+	out, err := os.OpenFile(outTarPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return 0, "", fmt.Errorf("create tar output %s: %w", outTarPath, err)
+	}
+	cw := &countingWriter{w: out, onDelta: onDelta}
+	hasher := sha256.New()
+	mw := io.MultiWriter(cw, hasher)
+	if err := CreateDeterministicTarToWriter(srcDir, mw); err != nil {
+		out.Close()
+		return cw.written, "", err
+	}
+	if err := out.Close(); err != nil {
+		return cw.written, "", err
+	}
+	return cw.written, hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+func reportSnapshotProgress(fn ProgressFunc, stage string, done, total int64) {
+	if fn == nil {
+		return
+	}
+	fn(ProgressEvent{
+		Stage:      stage,
+		BytesDone:  done,
+		BytesTotal: total,
+	})
+}
+
+type countingWriter struct {
+	w       io.Writer
+	onDelta func(int64)
+	written int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	if n > 0 {
+		c.written += int64(n)
+		if c.onDelta != nil {
+			c.onDelta(int64(n))
+		}
+	}
+	return n, err
 }

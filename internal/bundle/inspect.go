@@ -1,11 +1,13 @@
 package bundle
 
 import (
+	"archive/tar"
 	"fmt"
-	"os"
+	"io"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 
 	"infrakey/internal/crypto"
 	"infrakey/internal/manifest"
@@ -27,28 +29,36 @@ func Inspect(opts InspectOptions) (InspectResult, error) {
 		return InspectResult{}, fmt.Errorf("linux-only MVP: current platform is %s", runtime.GOOS)
 	}
 
-	workDir, err := os.MkdirTemp("", "infrakey-inspect-")
-	if err != nil {
-		return InspectResult{}, fmt.Errorf("create temp dir: %w", err)
-	}
-	defer os.RemoveAll(workDir)
-
-	tarPath := filepath.Join(workDir, "payload.tar")
-	if err := crypto.DecryptFile(opts.BundlePath, opts.IdentityKeyPath, tarPath); err != nil {
+	var mf manifest.Manifest
+	usedSidecar := false
+	if sidecarManifest, ok, err := tryReadInspectSidecar(opts.BundlePath, opts.IdentityKeyPath); err != nil {
 		return InspectResult{}, err
+	} else if ok {
+		mf = sidecarManifest
+		usedSidecar = true
+	} else {
+		bundleReader, _, err := OpenBundleReader(opts.BundlePath)
+		if err != nil {
+			return InspectResult{}, err
+		}
+		defer bundleReader.Close()
+		if err := crypto.DecryptFromReader(bundleReader, opts.IdentityKeyPath, func(r io.Reader) error {
+			parsed, err := readManifestFromTarReader(r)
+			if err != nil {
+				return err
+			}
+			mf = parsed
+			return nil
+		}); err != nil {
+			return InspectResult{}, err
+		}
 	}
-
-	payloadDir := filepath.Join(workDir, "payload")
-	if err := os.MkdirAll(payloadDir, 0o700); err != nil {
-		return InspectResult{}, fmt.Errorf("create payload dir: %w", err)
-	}
-	if err := ExtractTar(tarPath, payloadDir); err != nil {
-		return InspectResult{}, fmt.Errorf("extract payload: %w", err)
-	}
-
-	mf, err := manifest.ReadFromFile(filepath.Join(payloadDir, "manifest.pci.json"))
-	if err != nil {
-		return InspectResult{}, err
+	if !usedSidecar {
+		// Best-effort cache sidecar for subsequent fast inspect.
+		if recipient, err := crypto.RecipientFromIdentity(opts.IdentityKeyPath); err == nil {
+			_, inChunkDir := inspectSidecarPathForBundle(opts.BundlePath)
+			_ = writeInspectSidecar(opts.BundlePath, inChunkDir, mf, recipient)
+		}
 	}
 
 	outside := mf.OutsideRootSet()
@@ -67,4 +77,42 @@ func Inspect(opts InspectOptions) (InspectResult, error) {
 		Entries:  entries,
 		External: external,
 	}, nil
+}
+
+func readManifestFromTarReader(r io.Reader) (manifest.Manifest, error) {
+	tr := tar.NewReader(r)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return manifest.Manifest{}, fmt.Errorf("read tar: %w", err)
+		}
+
+		cleanName := filepath.Clean(filepath.FromSlash(hdr.Name))
+		if strings.HasPrefix(cleanName, ".."+string(filepath.Separator)) || cleanName == ".." {
+			return manifest.Manifest{}, fmt.Errorf("tar entry escapes destination: %q", hdr.Name)
+		}
+		if hdr.Typeflag != tar.TypeReg {
+			continue
+		}
+		if cleanName != "manifest.pci.json" {
+			if _, err := io.Copy(io.Discard, tr); err != nil {
+				return manifest.Manifest{}, fmt.Errorf("drain tar entry %q: %w", hdr.Name, err)
+			}
+			continue
+		}
+
+		b, err := io.ReadAll(tr)
+		if err != nil {
+			return manifest.Manifest{}, fmt.Errorf("read manifest entry: %w", err)
+		}
+		parsed, err := manifest.ReadFromBytes(b)
+		if err != nil {
+			return manifest.Manifest{}, err
+		}
+		return parsed, nil
+	}
+	return manifest.Manifest{}, fmt.Errorf("manifest.pci.json not found in payload")
 }

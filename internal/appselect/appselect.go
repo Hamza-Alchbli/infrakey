@@ -16,13 +16,17 @@ type App struct {
 	EstimatedSizeBytes int64
 }
 
+type Options struct {
+	IncludeVolumes bool
+}
+
 type Result struct {
 	RootDir                 string
 	Apps                    []App
 	TotalEstimatedSizeBytes int64
 }
 
-func Discover(root string) (Result, error) {
+func Discover(root string, opts Options) (Result, error) {
 	rootAbs, err := filepath.Abs(root)
 	if err != nil {
 		return Result{}, fmt.Errorf("resolve root: %w", err)
@@ -57,7 +61,7 @@ func Discover(root string) (Result, error) {
 			return Result{}, fmt.Errorf("parse compose file %s: %w", composePath, err)
 		}
 		for _, m := range parsed.Mentions {
-			if !includeInEstimate(m.Kind) {
+			if !includeInEstimate(m.Kind, opts.IncludeVolumes) {
 				continue
 			}
 			if _, ok := seenLocal[m.ResolvedAbs]; ok {
@@ -65,19 +69,22 @@ func Discover(root string) (Result, error) {
 			}
 			seenLocal[m.ResolvedAbs] = struct{}{}
 		}
+		if opts.IncludeVolumes {
+			seenLocal[filepath.Dir(composePath)] = struct{}{}
+		}
 
 		var appBytes int64
 		for p := range seenLocal {
-			fi, err := os.Stat(p)
-			if err != nil || !fi.Mode().IsRegular() {
+			size, ok := estimatePathSize(p)
+			if !ok {
 				continue
 			}
-			appBytes += fi.Size()
+			appBytes += size
 			if _, ok := seenGlobal[p]; ok {
 				continue
 			}
 			seenGlobal[p] = struct{}{}
-			totalBytes += fi.Size()
+			totalBytes += size
 		}
 
 		apps = append(apps, App{
@@ -135,11 +142,48 @@ func relativeDir(root, composePath string) string {
 	return relDir
 }
 
-func includeInEstimate(kind string) bool {
+func includeInEstimate(kind string, includeVolumes bool) bool {
 	switch kind {
 	case compose.MentionEnvFile, compose.MentionSecret, compose.MentionConfig, compose.MentionCert:
 		return true
+	case compose.MentionVolume:
+		return includeVolumes
 	default:
 		return false
 	}
+}
+
+func estimatePathSize(path string) (int64, bool) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, false
+	}
+	if fi.Mode().IsRegular() {
+		return fi.Size(), true
+	}
+	if !fi.IsDir() {
+		return 0, false
+	}
+
+	var total int64
+	err = filepath.WalkDir(path, func(current string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if info.Mode().IsRegular() {
+			total += info.Size()
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, false
+	}
+	return total, true
 }

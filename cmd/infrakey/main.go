@@ -3,10 +3,14 @@ package main
 import (
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"infrakey/internal/appselect"
 	"infrakey/internal/bundle"
@@ -50,17 +54,25 @@ func parseSnapshotFlags(args []string, name string) (bundle.SnapshotOptions, err
 	out := fs.String("out", "vault.bundle", "Output encrypted bundle path")
 	recipient := fs.String("recipient", "", "Age recipient public key")
 	identityOut := fs.String("identity-out", "identity.key", "Identity key output path (used when --recipient is not set)")
+	fullCopy := fs.Bool("full-copy", false, "Include bind-mounted volume data (files/directories)")
+	chunkSize := fs.String("chunk-size", "", "Split encrypted output into chunks (e.g. 2GB). Default in full-copy mode: 2GB")
 	if err := fs.Parse(args); err != nil {
 		return bundle.SnapshotOptions{}, err
 	}
 	if fs.NArg() > 0 {
 		return bundle.SnapshotOptions{}, fmt.Errorf("unexpected positional arguments: %v", fs.Args())
 	}
+	chunkBytes, err := parseChunkSize(*chunkSize, *fullCopy)
+	if err != nil {
+		return bundle.SnapshotOptions{}, err
+	}
 	return bundle.SnapshotOptions{
-		RootDir:     *root,
-		OutBundle:   *out,
-		Recipient:   *recipient,
-		IdentityOut: *identityOut,
+		RootDir:        *root,
+		OutBundle:      *out,
+		Recipient:      *recipient,
+		IdentityOut:    *identityOut,
+		FullCopy:       *fullCopy,
+		ChunkSizeBytes: chunkBytes,
 	}, nil
 }
 
@@ -75,14 +87,15 @@ func parseRestoreFlags(args []string, name string) (restore.Options, error) {
 	if err := fs.Parse(args); err != nil {
 		return restore.Options{}, err
 	}
-	if *bundlePath == "" || *identityKey == "" || *target == "" {
+	normalizedBundle := normalizeBundlePathInput(*bundlePath)
+	if normalizedBundle == "" || *identityKey == "" || *target == "" {
 		return restore.Options{}, fmt.Errorf("--bundle, --identity-key and --target are required")
 	}
 	if fs.NArg() > 0 {
 		return restore.Options{}, fmt.Errorf("unexpected positional arguments: %v", fs.Args())
 	}
 	return restore.Options{
-		BundlePath:      *bundlePath,
+		BundlePath:      normalizedBundle,
 		IdentityKeyPath: *identityKey,
 		TargetDir:       *target,
 		Yes:             *yes,
@@ -95,14 +108,17 @@ func runSnapshot(args []string) error {
 	if err != nil {
 		return err
 	}
-	selectedCompose, err := promptSnapshotSelection(opts.RootDir)
+	selectedCompose, err := promptSnapshotSelection(opts.RootDir, opts.FullCopy)
 	if err != nil {
 		return err
 	}
 	opts.ComposePaths = selectedCompose
-	printSnapshotKeySecurityNotice(opts, false)
+
+	progress := newProgressPrinter("Snapshot in progress")
+	opts.Progress = progress.UpdateSnapshot
 
 	summary, err := bundle.CreateSnapshot(opts)
+	progress.Stop(err)
 	if err != nil {
 		return err
 	}
@@ -116,9 +132,19 @@ func runSnapshot(args []string) error {
 	fmt.Printf("- Compose files: %d\n", summary.ComposeFiles)
 	fmt.Printf("- Captured files: %d\n", summary.CapturedFiles)
 	fmt.Printf("- External files: %d\n", summary.ExternalFiles)
+	if opts.FullCopy {
+		fmt.Printf("- Full copy mode: enabled\n")
+	}
+	if summary.Chunked {
+		fmt.Printf("- Bundle chunks: %d\n", summary.ChunkCount)
+		for _, p := range summary.ChunkPaths {
+			fmt.Printf("  - %s\n", p)
+		}
+	}
 	if summary.SkippedMissing > 0 {
 		fmt.Printf("- Skipped missing references: %d\n", summary.SkippedMissing)
 	}
+	printSnapshotKeySecurityNotice(opts, false)
 	return nil
 }
 
@@ -128,7 +154,11 @@ func runRestore(args []string) error {
 		return err
 	}
 
+	progress := newProgressPrinter("Restore in progress")
+	opts.Progress = progress.UpdateRestore
+
 	summary, err := restore.Run(opts)
+	progress.Stop(err)
 	if err != nil {
 		return err
 	}
@@ -150,16 +180,19 @@ func runInspect(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *bundlePath == "" || *identityKey == "" {
+	normalizedBundle := normalizeBundlePathInput(*bundlePath)
+	if normalizedBundle == "" || *identityKey == "" {
 		return fmt.Errorf("--bundle and --identity-key are required")
 	}
 	if fs.NArg() > 0 {
 		return fmt.Errorf("unexpected positional arguments: %v", fs.Args())
 	}
 
-	res, err := bundle.Inspect(bundle.InspectOptions{
-		BundlePath:      *bundlePath,
-		IdentityKeyPath: *identityKey,
+	res, err := runWithSpinner("Inspect in progress", func() (bundle.InspectResult, error) {
+		return bundle.Inspect(bundle.InspectOptions{
+			BundlePath:      normalizedBundle,
+			IdentityKeyPath: *identityKey,
+		})
 	})
 	if err != nil {
 		return err
@@ -206,14 +239,15 @@ func runDryRunSnapshot(args []string) error {
 	if err != nil {
 		return err
 	}
-	selectedCompose, err := promptSnapshotSelection(opts.RootDir)
+	selectedCompose, err := promptSnapshotSelection(opts.RootDir, opts.FullCopy)
 	if err != nil {
 		return err
 	}
 	opts.ComposePaths = selectedCompose
-	printSnapshotKeySecurityNotice(opts, true)
 
-	plan, err := bundle.PlanSnapshot(opts)
+	plan, err := runWithSpinner("Dry-run planning in progress", func() (bundle.SnapshotPlan, error) {
+		return bundle.PlanSnapshot(opts)
+	})
 	if err != nil {
 		return err
 	}
@@ -223,6 +257,12 @@ func runDryRunSnapshot(args []string) error {
 	fmt.Printf("- Bundle output: %s\n", plan.OutBundle)
 	if plan.WouldGenerateIdentity {
 		fmt.Printf("- Would generate identity key: %s\n", plan.IdentityPath)
+	}
+	if opts.FullCopy {
+		fmt.Printf("- Full copy mode: enabled\n")
+	}
+	if opts.ChunkSizeBytes > 0 {
+		fmt.Printf("- Chunk size: %s\n", humanBytes(opts.ChunkSizeBytes))
 	}
 	fmt.Printf("- Compose files found: %d\n", len(plan.ComposePaths))
 	fmt.Printf("- Captured entries: %d\n", len(plan.Entries))
@@ -240,6 +280,7 @@ func runDryRunSnapshot(args []string) error {
 	for _, e := range plan.Entries {
 		fmt.Printf("- %s (%s) -> %s\n", e.SourceAbsPath, e.Kind, e.RestoreRelPath)
 	}
+	printSnapshotKeySecurityNotice(opts, true)
 	return nil
 }
 
@@ -273,8 +314,10 @@ func runDryRunRestore(args []string) error {
 	return nil
 }
 
-func promptSnapshotSelection(root string) ([]string, error) {
-	result, err := appselect.Discover(root)
+func promptSnapshotSelection(root string, includeVolumes bool) ([]string, error) {
+	result, err := appselect.Discover(root, appselect.Options{
+		IncludeVolumes: includeVolumes,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -317,6 +360,286 @@ func allComposePaths(apps []appselect.App) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func parseChunkSize(raw string, fullCopy bool) (int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		if fullCopy {
+			return 2 * 1024 * 1024 * 1024, nil
+		}
+		return 0, nil
+	}
+	n, err := parseByteSize(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid --chunk-size %q: %w", raw, err)
+	}
+	return n, nil
+}
+
+func parseByteSize(s string) (int64, error) {
+	s = strings.TrimSpace(strings.ToUpper(s))
+	if s == "" {
+		return 0, fmt.Errorf("empty size")
+	}
+	if s == "0" {
+		return 0, nil
+	}
+	mult := int64(1)
+	suffixes := []struct {
+		suffix string
+		mult   int64
+	}{
+		{"TIB", 1024 * 1024 * 1024 * 1024},
+		{"GIB", 1024 * 1024 * 1024},
+		{"MIB", 1024 * 1024},
+		{"KIB", 1024},
+		{"TB", 1024 * 1024 * 1024 * 1024},
+		{"GB", 1024 * 1024 * 1024},
+		{"MB", 1024 * 1024},
+		{"KB", 1024},
+		{"T", 1024 * 1024 * 1024 * 1024},
+		{"G", 1024 * 1024 * 1024},
+		{"M", 1024 * 1024},
+		{"K", 1024},
+		{"B", 1},
+	}
+	for _, def := range suffixes {
+		suffix := def.suffix
+		if strings.HasSuffix(s, suffix) {
+			mult = def.mult
+			s = strings.TrimSpace(strings.TrimSuffix(s, suffix))
+			break
+		}
+	}
+	if s == "" {
+		return 0, fmt.Errorf("missing numeric size")
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("size must be non-negative")
+	}
+	if mult > 1 && n > (1<<63-1)/mult {
+		return 0, fmt.Errorf("size overflow")
+	}
+	return n * mult, nil
+}
+
+func normalizeBundlePathInput(in string) string {
+	p := strings.TrimSpace(in)
+	if p == "" {
+		return ""
+	}
+	clean := filepath.Clean(p)
+	if strings.HasSuffix(clean, ".parts") {
+		return strings.TrimSuffix(clean, ".parts")
+	}
+	return clean
+}
+
+func runWithSpinner[T any](label string, fn func() (T, error)) (T, error) {
+	if !isTTY(os.Stderr) {
+		return fn()
+	}
+
+	done := make(chan struct{})
+	var out T
+	var err error
+	start := time.Now()
+	go func() {
+		out, err = fn()
+		close(done)
+	}()
+
+	frames := []rune{'|', '/', '-', '\\'}
+	ticker := time.NewTicker(140 * time.Millisecond)
+	defer ticker.Stop()
+	i := 0
+	for {
+		select {
+		case <-done:
+			fmt.Fprintf(os.Stderr, "\r%s %s... done (%s)\n", infoLabel("info:"), label, elapsedShort(start))
+			return out, err
+		case <-ticker.C:
+			fmt.Fprintf(os.Stderr, "\r%s %s... %c %s", infoLabel("info:"), label, frames[i%len(frames)], elapsedShort(start))
+			i++
+		}
+	}
+}
+
+func elapsedShort(start time.Time) string {
+	d := time.Since(start).Round(time.Second)
+	if d < time.Second {
+		d = time.Second
+	}
+	return d.String()
+}
+
+type progressPrinter struct {
+	label     string
+	enabled   bool
+	startedAt time.Time
+
+	mu         sync.Mutex
+	stage      string
+	bytesDone  int64
+	bytesTotal int64
+	stageStart time.Time
+
+	tickerStop chan struct{}
+
+	lastLineLen int
+	stopped     bool
+}
+
+func newProgressPrinter(label string) *progressPrinter {
+	p := &progressPrinter{
+		label:      label,
+		enabled:    isTTY(os.Stderr),
+		startedAt:  time.Now(),
+		stage:      "starting",
+		stageStart: time.Now(),
+		tickerStop: make(chan struct{}),
+	}
+	if p.enabled {
+		go p.tickLoop()
+	}
+	return p
+}
+
+func (p *progressPrinter) UpdateSnapshot(ev bundle.ProgressEvent) {
+	p.update(ev.Stage, ev.BytesDone, ev.BytesTotal)
+}
+
+func (p *progressPrinter) UpdateRestore(ev restore.ProgressEvent) {
+	p.update(ev.Stage, ev.BytesDone, ev.BytesTotal)
+}
+
+func (p *progressPrinter) update(stage string, done, total int64) {
+	if !p.enabled {
+		return
+	}
+	now := time.Now()
+	p.mu.Lock()
+	if p.stopped {
+		p.mu.Unlock()
+		return
+	}
+	if stage != "" && stage != p.stage {
+		p.stage = stage
+		p.stageStart = now
+	}
+	p.bytesDone = done
+	p.bytesTotal = total
+	line, lineLen := p.renderLineLocked(now)
+	p.lastLineLen = lineLen
+	p.mu.Unlock()
+	fmt.Fprintf(os.Stderr, "\r%s", line)
+}
+
+func (p *progressPrinter) Stop(runErr error) {
+	if !p.enabled {
+		return
+	}
+	closeTicker := false
+	p.mu.Lock()
+	if p.stopped {
+		p.mu.Unlock()
+		return
+	}
+	p.stopped = true
+	closeTicker = true
+	elapsed := elapsedShort(p.startedAt)
+	lastLineLen := p.lastLineLen
+	p.mu.Unlock()
+	if closeTicker {
+		close(p.tickerStop)
+	}
+
+	status := "done"
+	if runErr != nil {
+		status = "failed"
+	}
+	line := fmt.Sprintf("%s %s... %s (%s)", infoLabel("info:"), p.label, status, elapsed)
+	if pad := lastLineLen - len(line); pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+	fmt.Fprintf(os.Stderr, "\r%s\n", line)
+}
+
+func (p *progressPrinter) tickLoop() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.tickerStop:
+			return
+		case now := <-ticker.C:
+			line, lineLen, ok := p.renderCurrent(now)
+			if !ok {
+				return
+			}
+			fmt.Fprintf(os.Stderr, "\r%s", line)
+			p.mu.Lock()
+			p.lastLineLen = lineLen
+			p.mu.Unlock()
+		}
+	}
+}
+
+func (p *progressPrinter) renderCurrent(now time.Time) (string, int, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.stopped {
+		return "", 0, false
+	}
+	line, lineLen := p.renderLineLocked(now)
+	return line, lineLen, true
+}
+
+func (p *progressPrinter) renderLineLocked(now time.Time) (string, int) {
+	stage := p.stage
+	if stage == "" {
+		stage = "working"
+	}
+	stageElapsed := now.Sub(p.stageStart)
+	if stageElapsed <= 0 {
+		stageElapsed = time.Millisecond
+	}
+	totalElapsed := elapsedShort(p.startedAt)
+	throughput := float64(p.bytesDone) / stageElapsed.Seconds()
+	if math.IsNaN(throughput) || math.IsInf(throughput, 0) || throughput < 0 {
+		throughput = 0
+	}
+
+	progressPart := ""
+	if p.bytesTotal > 0 {
+		pct := float64(0)
+		if p.bytesTotal > 0 {
+			pct = (float64(p.bytesDone) / float64(p.bytesTotal)) * 100
+		}
+		if pct < 0 {
+			pct = 0
+		}
+		if pct > 100 {
+			pct = 100
+		}
+		progressPart = fmt.Sprintf(" %s / %s (%.0f%%)", humanBytes(p.bytesDone), humanBytes(p.bytesTotal), pct)
+	} else if p.bytesDone > 0 {
+		progressPart = fmt.Sprintf(" %s", humanBytes(p.bytesDone))
+	}
+	speedPart := ""
+	if throughput > 0 && p.bytesDone > 0 {
+		speedPart = fmt.Sprintf(" @ %s/s", humanBytes(int64(throughput)))
+	}
+	line := fmt.Sprintf("%s %s [%s] %s%s%s", infoLabel("info:"), p.label, stage, totalElapsed, progressPart, speedPart)
+	if pad := p.lastLineLen - len(line); pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+	return line, len(line)
 }
 
 func humanBytes(size int64) string {
@@ -391,6 +714,10 @@ func supportsColor(f *os.File) bool {
 	if os.Getenv("NO_COLOR") != "" {
 		return false
 	}
+	return isTTY(f)
+}
+
+func isTTY(f *os.File) bool {
 	st, err := f.Stat()
 	if err != nil {
 		return false
@@ -402,9 +729,9 @@ func printUsage(w *os.File) {
 	fmt.Fprintln(w, "InfraKey (Linux-only MVP)")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  infrakey snapshot --root <dir> --out <vault.bundle> [--recipient <age-pubkey>] [--identity-out <identity.key>]")
+	fmt.Fprintln(w, "  infrakey snapshot --root <dir> --out <vault.bundle> [--recipient <age-pubkey>] [--identity-out <identity.key>] [--full-copy] [--chunk-size <size>]")
 	fmt.Fprintln(w, "  infrakey restore --bundle <vault.bundle> --identity-key <identity.key> --target <dir> [--yes] [--include-external all|none]")
 	fmt.Fprintln(w, "  infrakey inspect --bundle <vault.bundle> --identity-key <identity.key>")
-	fmt.Fprintln(w, "  infrakey dry-run snapshot --root <dir> --out <vault.bundle> [--recipient <age-pubkey>] [--identity-out <identity.key>]")
+	fmt.Fprintln(w, "  infrakey dry-run snapshot --root <dir> --out <vault.bundle> [--recipient <age-pubkey>] [--identity-out <identity.key>] [--full-copy] [--chunk-size <size>]")
 	fmt.Fprintln(w, "  infrakey dry-run restore --bundle <vault.bundle> --identity-key <identity.key> --target <dir> [--yes] [--include-external all|none]")
 }
