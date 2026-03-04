@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"infrakey/internal/bundle"
 	"infrakey/internal/crypto"
@@ -361,13 +363,67 @@ func applyComposeRewrites(stagingDir, targetAbs string, mf manifest.Manifest, en
 			if err != nil {
 				return fmt.Errorf("resolve compose rewrite restored path %q: %w", repl.RestoredPath, err)
 			}
-			content = strings.ReplaceAll(content, repl.OriginalPath, filepath.ToSlash(newPathAbs))
+			content = replaceExactPathLiterals(content, repl.OriginalPath, filepath.ToSlash(newPathAbs))
 		}
 		if err := os.WriteFile(composePath, []byte(content), 0o600); err != nil {
 			return fmt.Errorf("write rewritten compose file %q: %w", composePath, err)
 		}
 	}
 	return nil
+}
+
+func replaceExactPathLiterals(content, oldPath, newPath string) string {
+	if oldPath == "" || oldPath == newPath {
+		return content
+	}
+
+	var out strings.Builder
+	out.Grow(len(content))
+	for i := 0; i < len(content); {
+		idx := strings.Index(content[i:], oldPath)
+		if idx < 0 {
+			out.WriteString(content[i:])
+			break
+		}
+		start := i + idx
+		end := start + len(oldPath)
+		if hasPathBoundaryBefore(content, start) && hasPathBoundaryAfter(content, end) {
+			out.WriteString(content[i:start])
+			out.WriteString(newPath)
+			i = end
+			continue
+		}
+		out.WriteString(content[i : start+1])
+		i = start + 1
+	}
+	return out.String()
+}
+
+func hasPathBoundaryBefore(s string, start int) bool {
+	if start <= 0 {
+		return true
+	}
+	r, _ := utf8.DecodeLastRuneInString(s[:start])
+	return !isPathTokenRune(r)
+}
+
+func hasPathBoundaryAfter(s string, end int) bool {
+	if end >= len(s) {
+		return true
+	}
+	r, _ := utf8.DecodeRuneInString(s[end:])
+	return !isPathTokenRune(r)
+}
+
+func isPathTokenRune(r rune) bool {
+	if unicode.IsLetter(r) || unicode.IsDigit(r) {
+		return true
+	}
+	switch r {
+	case '/', '.', '-', '_', '~', '\\':
+		return true
+	}
+	return false
 }
 
 func ensureTargetEmptyOrAbsent(targetAbs string) error {

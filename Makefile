@@ -1,4 +1,4 @@
-.PHONY: help build test \
+.PHONY: help build test audit \
 	bin bin-linux bin-linux-arm64 bin-macos bin-macos-amd64 bin-all clean-bin
 
 GO ?= go
@@ -12,6 +12,7 @@ help:
 	@echo "Targets:"
 	@echo "  make build            # compile all packages"
 	@echo "  make test             # run all tests"
+	@echo "  make audit            # run test + race + vet checks"
 	@echo "  make bin              # build CLI for current OS/ARCH -> $(BIN_DIR)/$(BINARY)"
 	@echo "  make bin-linux        # build Linux amd64 CLI -> $(BIN_DIR)/$(BINARY)-linux-amd64"
 	@echo "  make bin-linux-arm64  # build Linux arm64 CLI -> $(BIN_DIR)/$(BINARY)-linux-arm64"
@@ -25,6 +26,11 @@ build:
 
 test:
 	$(GO) test ./...
+
+audit:
+	$(GO) test ./...
+	$(GO) test -race ./...
+	$(GO) vet ./...
 
 bin:
 	mkdir -p $(BIN_DIR)

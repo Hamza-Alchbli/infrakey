@@ -10,12 +10,12 @@ func TestManifestValidate(t *testing.T) {
 		SourceRoot: "/srv/apps",
 		Entries: []Entry{
 			{
-				ID:            "entry1",
-				Kind:          KindCompose,
-				SourceAbsPath: "/srv/apps/compose.yml",
+				ID:             "entry1",
+				Kind:           KindCompose,
+				SourceAbsPath:  "/srv/apps/compose.yml",
 				RestoreRelPath: "compose.yml",
-				SHA256:        "abc",
-				Mode:          "0644",
+				SHA256:         "abc",
+				Mode:           "0644",
 			},
 		},
 		OutsideRootEntries: []string{"entry1"},
@@ -33,15 +33,75 @@ func TestManifestValidateUnknownOutsideEntry(t *testing.T) {
 		SourceRoot: "/srv/apps",
 		Entries: []Entry{
 			{
-				ID:            "entry1",
-				Kind:          KindCompose,
-				SourceAbsPath: "/srv/apps/compose.yml",
+				ID:             "entry1",
+				Kind:           KindCompose,
+				SourceAbsPath:  "/srv/apps/compose.yml",
 				RestoreRelPath: "compose.yml",
-				SHA256:        "abc",
-				Mode:          "0644",
+				SHA256:         "abc",
+				Mode:           "0644",
 			},
 		},
 		OutsideRootEntries: []string{"missing"},
+	}
+	if err := m.Validate(); err == nil {
+		t.Fatalf("expected validation error")
+	}
+}
+
+func TestManifestValidateUnknownComposeRewriteEntry(t *testing.T) {
+	m := Manifest{
+		PCIVersion: CurrentPCIVersion,
+		SnapshotID: "snap-1",
+		CreatedAt:  "2026-02-28T10:00:00Z",
+		SourceRoot: "/srv/apps",
+		Entries: []Entry{
+			{
+				ID:             "entry1",
+				Kind:           KindCompose,
+				SourceAbsPath:  "/srv/apps/compose.yml",
+				RestoreRelPath: "compose.yml",
+				SHA256:         "abc",
+				Mode:           "0644",
+			},
+		},
+		ComposeRewrites: []ComposeRewrite{
+			{
+				ComposeEntryID: "missing",
+				Replacements: []PathReplacement{
+					{OriginalPath: "/etc/app.env", RestoredPath: "._infrakey_external/abc/app.env"},
+				},
+			},
+		},
+	}
+	if err := m.Validate(); err == nil {
+		t.Fatalf("expected validation error")
+	}
+}
+
+func TestManifestValidateComposeRewriteRequiresPaths(t *testing.T) {
+	m := Manifest{
+		PCIVersion: CurrentPCIVersion,
+		SnapshotID: "snap-1",
+		CreatedAt:  "2026-02-28T10:00:00Z",
+		SourceRoot: "/srv/apps",
+		Entries: []Entry{
+			{
+				ID:             "entry1",
+				Kind:           KindCompose,
+				SourceAbsPath:  "/srv/apps/compose.yml",
+				RestoreRelPath: "compose.yml",
+				SHA256:         "abc",
+				Mode:           "0644",
+			},
+		},
+		ComposeRewrites: []ComposeRewrite{
+			{
+				ComposeEntryID: "entry1",
+				Replacements: []PathReplacement{
+					{OriginalPath: "", RestoredPath: "._infrakey_external/abc/app.env"},
+				},
+			},
+		},
 	}
 	if err := m.Validate(); err == nil {
 		t.Fatalf("expected validation error")

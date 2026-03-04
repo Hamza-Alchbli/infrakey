@@ -461,7 +461,11 @@ func runWithSpinner[T any](label string, fn func() (T, error)) (T, error) {
 	for {
 		select {
 		case <-done:
-			fmt.Fprintf(os.Stderr, "\r%s %s... done (%s)\n", infoLabel("info:"), label, elapsedShort(start))
+			status := "done"
+			if err != nil {
+				status = "failed"
+			}
+			fmt.Fprintf(os.Stderr, "\r%s %s... %s (%s)\n", infoLabel("info:"), label, status, elapsedShort(start))
 			return out, err
 		case <-ticker.C:
 			fmt.Fprintf(os.Stderr, "\r%s %s... %c %s", infoLabel("info:"), label, frames[i%len(frames)], elapsedShort(start))

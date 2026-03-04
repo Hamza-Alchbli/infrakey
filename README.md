@@ -2,6 +2,10 @@
 
 InfraKey snapshots Docker Compose configuration identity (compose files + referenced env/secrets/config/cert files), encrypts it with [`age`](https://age-encryption.org/), and restores it atomically on a new Linux machine.
 
+## New to this codebase?
+
+Start with [`docs/CODEBASE_MAP.md`](docs/CODEBASE_MAP.md). It explains the architecture, file ownership by package, and where bug risk is concentrated in plain English.
+
 ## Scope boundary
 
 Included:
