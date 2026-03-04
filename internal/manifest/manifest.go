@@ -75,7 +75,7 @@ func (m Manifest) Validate() error {
 	if m.SourceRoot == "" {
 		return errors.New("sourceRoot is required")
 	}
-	ids := map[string]struct{}{}
+	ids := map[string]Entry{}
 	for _, e := range m.Entries {
 		if e.ID == "" {
 			return errors.New("entry id is required")
@@ -83,7 +83,7 @@ func (m Manifest) Validate() error {
 		if _, ok := ids[e.ID]; ok {
 			return fmt.Errorf("duplicate entry id %q", e.ID)
 		}
-		ids[e.ID] = struct{}{}
+		ids[e.ID] = e
 		if e.Kind == "" || e.SourceAbsPath == "" || e.RestoreRelPath == "" || e.SHA256 == "" || e.Mode == "" {
 			return fmt.Errorf("entry %q is missing required fields", e.ID)
 		}
@@ -97,6 +97,28 @@ func (m Manifest) Validate() error {
 	for _, id := range m.OutsideRootEntries {
 		if _, ok := ids[id]; !ok {
 			return fmt.Errorf("outsideRootEntries references unknown entry %q", id)
+		}
+	}
+	rewriteSeen := map[string]struct{}{}
+	for _, rw := range m.ComposeRewrites {
+		if rw.ComposeEntryID == "" {
+			return errors.New("composeRewrite composeEntryId is required")
+		}
+		entry, ok := ids[rw.ComposeEntryID]
+		if !ok {
+			return fmt.Errorf("composeRewrite references unknown entry %q", rw.ComposeEntryID)
+		}
+		if entry.Kind != KindCompose {
+			return fmt.Errorf("composeRewrite entry %q must reference kind %q", rw.ComposeEntryID, KindCompose)
+		}
+		if _, dup := rewriteSeen[rw.ComposeEntryID]; dup {
+			return fmt.Errorf("duplicate composeRewrite for composeEntryId %q", rw.ComposeEntryID)
+		}
+		rewriteSeen[rw.ComposeEntryID] = struct{}{}
+		for _, repl := range rw.Replacements {
+			if repl.OriginalPath == "" || repl.RestoredPath == "" {
+				return fmt.Errorf("composeRewrite %q contains empty replacement path", rw.ComposeEntryID)
+			}
 		}
 	}
 	return nil
